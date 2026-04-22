@@ -6,6 +6,8 @@
     <title>AccessPulse | IT Access Control Center</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <!-- Google Identity Services -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
         /* Custom dark mode overrides */
         .dark .bg-white {
@@ -23,12 +25,27 @@
             color: #3b82f6 !important;
             font-weight: 800;
         }
+
+        #loginSpinner {
+            border: 3px solid #334155;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 0.8s linear infinite;
+            display: none;
+            margin: 0 auto;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 
 <body class="bg-slate-950 text-slate-100">
 
-    <!-- LOGIN SCREEN (Google SSO style) -->
+    <!-- LOGIN SCREEN (Google SSO) -->
     <div id="loginScreen" class="fixed inset-0 bg-slate-900 flex items-center justify-center p-4 z-[200]">
         <div class="bg-white p-10 rounded-[2.5rem] shadow-2xl max-w-sm w-full text-center text-slate-900">
             <h2 class="text-3xl font-black mb-2">AccessPulse</h2>
@@ -36,8 +53,8 @@
                 Sign in with Google Workspace
             </p>
 
-            <!-- Mock Google SSO button -->
-            <button onclick="startGoogleSignIn()"
+            <!-- Google SSO button -->
+            <button id="googleSignInBtn" onclick="startGoogleSignIn()"
                 class="w-full border border-slate-300 rounded-2xl py-3 px-4 flex items-center justify-center gap-3 hover:bg-slate-100 transition">
                 <img src="https://www.google.com/favicon.ico" alt="G" class="w-5 h-5">
                 <span class="text-sm font-semibold text-slate-800">
@@ -45,10 +62,16 @@
                 </span>
             </button>
 
+            <!-- Spinner shown while waiting for Google -->
+            <div id="loginSpinner" class="mt-4"></div>
+
+            <!-- Error message area -->
+            <p id="loginError" class="mt-3 text-xs text-rose-500 font-semibold hidden"></p>
+
             <p class="mt-4 text-[11px] text-slate-400 leading-relaxed">
-                This prototype uses a simulated Google Workspace SSO flow.
-                Your email determines whether you are an <strong>Admin</strong> or
-                <strong>Manager</strong>.
+                Sign in with your Google Workspace account.<br>
+                <strong>@sttrinity.com.au</strong> accounts are granted <strong>Admin</strong> access.
+                All others are granted <strong>Manager</strong> access.
             </p>
         </div>
     </div>
@@ -392,28 +415,161 @@
     </div>
 
     <script>
-        // DATA INITIALIZATION
+        // ─── GOOGLE OAUTH CONFIG ───────────────────────────────────────────────────
+        const GOOGLE_CLIENT_ID = '1097052549624-jv1v5maa61ucfnpclcnh2mag40huqdsc.apps.googleusercontent.com';
+
+        // ─── DATA INITIALIZATION ──────────────────────────────────────────────────
         let users = JSON.parse(localStorage.getItem('ap_users')) || [];
         let apps = JSON.parse(localStorage.getItem('ap_apps')) || [];
         let assignments = JSON.parse(localStorage.getItem('ap_assignments')) || [];
         let systemLogs = JSON.parse(localStorage.getItem('ap_systemLogs')) || [];
         let authorizers = JSON.parse(localStorage.getItem('ap_authorizers')) || ["Mark Ramirez", "Joe Khoury"];
-        let editingId = null; // Used for user edits
+        let editingId = null;
 
         // Auth state
-        let currentUserType = localStorage.getItem('ap_currentUserType') || null; // "Admin" or "Manager"
+        let currentUserType = localStorage.getItem('ap_currentUserType') || null;
         let currentUserEmail = localStorage.getItem('ap_currentUserEmail') || null;
         let currentUserName = localStorage.getItem('ap_currentUserName') || null;
+        let googleTokenClient = null; // holds the Google token client instance
 
-        function isAdmin() {
-            return currentUserType === 'Admin';
+        function isAdmin() { return currentUserType === 'Admin'; }
+        function isManager() { return currentUserType === 'Manager'; }
+
+        // ─── GOOGLE SSO ────────────────────────────────────────────────────────────
+
+        /**
+         * Called when the user clicks "Sign in with Google".
+         * Initialises the Google token client (if not already done) and requests
+         * an access token via the implicit grant / popup flow.
+         */
+        function startGoogleSignIn() {
+            const btn = document.getElementById('googleSignInBtn');
+            const spinner = document.getElementById('loginSpinner');
+            const errorEl = document.getElementById('loginError');
+
+            // Show loading state
+            btn.disabled = true;
+            btn.classList.add('opacity-50', 'cursor-not-allowed');
+            spinner.style.display = 'block';
+            errorEl.classList.add('hidden');
+
+            // Guard: GIS library may not be loaded yet (race condition on slow connections)
+            if (typeof google === 'undefined' || !google.accounts) {
+                showLoginError('Google Sign-In library is still loading. Please wait a moment and try again.');
+                resetLoginBtn();
+                return;
+            }
+
+            // Initialise the token client once
+            if (!googleTokenClient) {
+                googleTokenClient = google.accounts.oauth2.initTokenClient({
+                    client_id: GOOGLE_CLIENT_ID,
+                    scope: 'email profile openid',
+                    callback: handleGoogleTokenResponse,
+                    error_callback: (err) => {
+                        showLoginError('Google sign-in was cancelled or failed. Please try again.');
+                        resetLoginBtn();
+                    }
+                });
+            }
+
+            // Open the Google consent popup
+            googleTokenClient.requestAccessToken({ prompt: 'select_account' });
         }
 
-        function isManager() {
-            return currentUserType === 'Manager';
+        /**
+         * Called by the Google token client with the access token after the user
+         * successfully picks their account and grants consent.
+         */
+        function handleGoogleTokenResponse(tokenResponse) {
+            if (tokenResponse.error) {
+                showLoginError('Authentication failed: ' + tokenResponse.error);
+                resetLoginBtn();
+                return;
+            }
+
+            // Exchange the token for the user's profile info
+            fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                headers: { Authorization: 'Bearer ' + tokenResponse.access_token }
+            })
+            .then(res => {
+                if (!res.ok) throw new Error('Failed to fetch user profile.');
+                return res.json();
+            })
+            .then(profile => {
+                const email = (profile.email || '').toLowerCase();
+                const displayName = profile.name || email.split('@')[0];
+
+                if (!email) {
+                    showLoginError('Could not retrieve your email from Google. Please try again.');
+                    resetLoginBtn();
+                    return;
+                }
+
+                // Role assignment: @sttrinity.com.au → Admin, everything else → Manager
+                const roleGuess = email.endsWith('@sttrinity.com.au') ? 'Admin' : 'Manager';
+
+                // Persist session
+                currentUserEmail = email;
+                currentUserName = displayName;
+                currentUserType = roleGuess;
+
+                localStorage.setItem('ap_currentUserEmail', currentUserEmail);
+                localStorage.setItem('ap_currentUserName', currentUserName);
+                localStorage.setItem('ap_currentUserType', currentUserType);
+
+                logSystemEvent('Login', `${currentUserName} (${currentUserEmail}) signed in as ${currentUserType} via Google SSO.`);
+
+                // Enter the app
+                document.getElementById('loginScreen').classList.add('hidden');
+                document.getElementById('mainContent').classList.remove('hidden');
+                resetLoginBtn();
+                applyRoleUI();
+                renderData();
+            })
+            .catch(err => {
+                showLoginError('Error fetching your profile: ' + err.message);
+                resetLoginBtn();
+            });
         }
 
-        // CORE UI & AUTH
+        function showLoginError(msg) {
+            const errorEl = document.getElementById('loginError');
+            errorEl.textContent = msg;
+            errorEl.classList.remove('hidden');
+        }
+
+        function resetLoginBtn() {
+            const btn = document.getElementById('googleSignInBtn');
+            const spinner = document.getElementById('loginSpinner');
+            btn.disabled = false;
+            btn.classList.remove('opacity-50', 'cursor-not-allowed');
+            spinner.style.display = 'none';
+        }
+
+        function logout() {
+            logSystemEvent('Logout', `${currentUserName || ''} (${currentUserEmail || ''}) logged out.`);
+
+            // Revoke the Google token so user is prompted to pick account again next time
+            if (typeof google !== 'undefined' && google.accounts && currentUserEmail) {
+                google.accounts.id.revoke(currentUserEmail, () => {});
+            }
+            googleTokenClient = null;
+
+            currentUserType = null;
+            currentUserEmail = null;
+            currentUserName = null;
+            localStorage.removeItem('ap_currentUserType');
+            localStorage.removeItem('ap_currentUserEmail');
+            localStorage.removeItem('ap_currentUserName');
+
+            document.getElementById('mainContent').classList.add('hidden');
+            document.getElementById('loginScreen').classList.remove('hidden');
+            updateIdentityIndicators();
+        }
+
+        // ─── CORE UI ───────────────────────────────────────────────────────────────
+
         function applyTheme() {
             document.documentElement.classList.add('dark');
             document.body.className = 'bg-slate-950 text-slate-100 transition-colors duration-300';
@@ -422,13 +578,11 @@
         function updateIdentityIndicators() {
             const roleEl = document.getElementById('roleIndicator');
             const emailEl = document.getElementById('userEmailIndicator');
-
             if (!currentUserType || !currentUserEmail) {
                 roleEl.textContent = '';
                 emailEl.textContent = '';
                 return;
             }
-
             roleEl.textContent = `Role: ${currentUserType}`;
             emailEl.textContent = currentUserEmail;
         }
@@ -436,77 +590,15 @@
         function applyRoleUI() {
             const isA = isAdmin();
 
-            // New User button (Admin only)
             const newUserBtn = document.querySelector('#view-users button[onclick="openModal(\'user\')"]');
-            if (newUserBtn) {
-                newUserBtn.style.display = isA ? 'inline-flex' : 'none';
-            }
+            if (newUserBtn) newUserBtn.style.display = isA ? 'inline-flex' : 'none';
 
-            // New App button (Admin only)
             const newAppBtn = document.querySelector('#view-apps button[onclick="openModal(\'app\')"]');
-            if (newAppBtn) {
-                newAppBtn.style.display = isA ? 'inline-flex' : 'none';
-            }
+            if (newAppBtn) newAppBtn.style.display = isA ? 'inline-flex' : 'none';
 
-            // Settings tab (Admin only)
             const tabSettings = document.getElementById('tab-settings');
-            if (tabSettings) {
-                tabSettings.style.display = isA ? 'inline-flex' : 'none';
-            }
+            if (tabSettings) tabSettings.style.display = isA ? 'inline-flex' : 'none';
 
-            updateIdentityIndicators();
-        }
-
-        // Simulated Google Workspace SSO
-        function startGoogleSignIn() {
-            // Simple prompt-based mock. In a real app, replace with Google OAuth flow.
-            const email = prompt("Enter your Google Workspace email:");
-            if (!email) return;
-
-            const trimmed = email.trim().toLowerCase();
-            if (!trimmed.includes("@")) {
-                alert("Please enter a valid email.");
-                return;
-            }
-
-            let roleGuess = "Manager";
-            if (trimmed.endsWith("@sttrinity.com.au")) {
-                roleGuess = "Admin";
-            }
-
-            const namePart = trimmed.split("@")[0].replace(/\./g, " ");
-            const displayName = namePart
-                .split(" ")
-                .filter(Boolean)
-                .map(s => s.charAt(0).toUpperCase() + s.slice(1))
-                .join(" ");
-
-            currentUserEmail = trimmed;
-            currentUserName = displayName || "Google User";
-            currentUserType = roleGuess;
-
-            localStorage.setItem('ap_currentUserEmail', currentUserEmail);
-            localStorage.setItem('ap_currentUserName', currentUserName);
-            localStorage.setItem('ap_currentUserType', currentUserType);
-
-            logSystemEvent('Login', `${currentUserName} (${currentUserEmail}) signed in as ${currentUserType} via Google SSO (simulated).`);
-
-            document.getElementById('loginScreen').classList.add('hidden');
-            document.getElementById('mainContent').classList.remove('hidden');
-            applyRoleUI();
-            renderData();
-        }
-
-        function logout() {
-            logSystemEvent('Logout', `${currentUserName || ''} (${currentUserEmail || ''}) logged out.`);
-            currentUserType = null;
-            currentUserEmail = null;
-            currentUserName = null;
-            localStorage.removeItem('ap_currentUserType');
-            localStorage.removeItem('ap_currentUserEmail');
-            localStorage.removeItem('ap_currentUserName');
-            document.getElementById('mainContent').classList.add('hidden');
-            document.getElementById('loginScreen').classList.remove('hidden');
             updateIdentityIndicators();
         }
 
@@ -520,9 +612,9 @@
             renderData();
         }
 
-        // DATA RENDERING
+        // ─── DATA RENDERING ────────────────────────────────────────────────────────
+
         function renderData() {
-            // Stats Calculation
             let active = 0, revoked = 0, expiredCount = 0;
             const now = new Date();
             const expItemsRaw = assignments.filter(a =>
@@ -544,7 +636,6 @@
             document.getElementById('notifBadge').innerText = expItemsRaw.length;
             document.getElementById('notifBadge').classList.toggle('hidden', expItemsRaw.length === 0);
 
-            // RENDER TABLES
             renderUserTable();
             renderLogTable();
             renderAppGrid();
@@ -552,20 +643,14 @@
             renderSystemLogTable();
             renderSettings();
 
-            // RENDER FORM OPTIONS
             document.getElementById('form-user').innerHTML =
                 '<option disabled selected value="">Select User</option>' +
-                users
-                    .filter(u => !u.deleted)
-                    .map(u => `<option value="${u.id}">${u.name}</option>`)
-                    .join('');
+                users.filter(u => !u.deleted).map(u => `<option value="${u.id}">${u.name}</option>`).join('');
 
             document.getElementById('form-role').innerHTML =
                 '<option disabled selected value="">Dept</option>' +
-                [...new Set(users.filter(u => !u.deleted).map(u => u.dept))]
-                    .filter(d => d)
-                    .map(d => `<option value="${d}">${d}</option>`)
-                    .join('');
+                [...new Set(users.filter(u => !u.deleted).map(u => u.dept))].filter(d => d)
+                    .map(d => `<option value="${d}">${d}</option>`).join('');
 
             document.getElementById('form-auth').innerHTML =
                 authorizers.map(a => `<option value="${a}">${a}</option>`).join('');
@@ -578,38 +663,32 @@
             const term = (document.getElementById('userSearch')?.value || "").toLowerCase().trim();
             const userTable = document.getElementById('userTableBody');
             userTable.innerHTML = "";
-            users
-                .filter(u => !u.deleted)
-                .forEach(u => {
-                    const matches = [u.name, u.empID, u.manager, u.dept, u.email]
-                        .some(field => String(field || "").toLowerCase().includes(term));
-                    if (!term || matches) {
-                        const ua = assignments.filter(a => a.userId == u.id && a.status === 'Active');
-                        const appsHtml = ua.length > 0
-                            ? `<select class="bg-slate-700 p-2 rounded-lg text-[10px] font-black uppercase text-white outline-none">
-                               <option selected>${ua.length} ACTIVE</option>
-                               ${ua.map(a => `<option disabled>${a.appName}</option>`).join('')}
-                           </select>`
-                            : `<span class="text-[9px] font-bold text-slate-500 uppercase">None</span>`;
-                        const row = `<tr>
+            users.filter(u => !u.deleted).forEach(u => {
+                const matches = [u.name, u.empID, u.manager, u.dept, u.email]
+                    .some(field => String(field || "").toLowerCase().includes(term));
+                if (!term || matches) {
+                    const ua = assignments.filter(a => a.userId == u.id && a.status === 'Active');
+                    const appsHtml = ua.length > 0
+                        ? `<select class="bg-slate-700 p-2 rounded-lg text-[10px] font-black uppercase text-white outline-none">
+                           <option selected>${ua.length} ACTIVE</option>
+                           ${ua.map(a => `<option disabled>${a.appName}</option>`).join('')}
+                       </select>`
+                        : `<span class="text-[9px] font-bold text-slate-500 uppercase">None</span>`;
+                    userTable.insertAdjacentHTML('beforeend', `<tr>
                         <td class="p-6 text-xs text-slate-400 font-bold">${u.empID || '—'}</td>
                         <td class="p-6 font-bold text-white">
-                            <a href="#" onclick="showUserDetail('${u.id}'); return false;" class="hover:underline">
-                                ${u.name || 'Unknown'}
-                            </a>
+                            <a href="#" onclick="showUserDetail('${u.id}'); return false;" class="hover:underline">${u.name || 'Unknown'}</a>
                         </td>
                         <td class="p-6 text-xs text-blue-400 font-bold">${u.email || '—'}</td>
                         <td class="p-6 text-xs font-bold text-slate-500 uppercase">${u.dept || '—'}</td>
                         <td class="p-6 text-xs font-bold text-slate-400">${u.manager || '—'}</td>
                         <td class="p-6">${appsHtml}</td>
                         <td class="p-6 text-right">
-                            <button onclick="editUser('${u.id}')"
-                                    class="text-blue-500 text-[10px] font-black uppercase hover:underline">Edit</button>
+                            <button onclick="editUser('${u.id}')" class="text-blue-500 text-[10px] font-black uppercase hover:underline">Edit</button>
                         </td>
-                    </tr>`;
-                        userTable.insertAdjacentHTML('beforeend', row);
-                    }
-                });
+                    </tr>`);
+                }
+            });
         }
 
         function renderLogTable() {
@@ -625,11 +704,9 @@
                 if (matchTerm && matchStatus) {
                     const expiryDisplay = a.expiry === 'No Expiration' ? 'Never' : new Date(a.expiry).toLocaleDateString();
                     const grantDateDisplay = new Date(a.date).toLocaleDateString();
-                    const statusClass =
-                        sl === 'Active' ? 'bg-emerald-900/30 text-emerald-400'
-                            : (sl === 'Expired' ? 'bg-rose-900/30 text-rose-400'
-                                : 'bg-slate-700 text-slate-400');
-                    const row = `<tr>
+                    const statusClass = sl === 'Active' ? 'bg-emerald-900/30 text-emerald-400'
+                        : (sl === 'Expired' ? 'bg-rose-900/30 text-rose-400' : 'bg-slate-700 text-slate-400');
+                    logTable.insertAdjacentHTML('beforeend', `<tr>
                     <td class="p-6 font-bold text-white">${a.userName}</td>
                     <td class="p-6 text-blue-400 font-black uppercase text-xs">${a.appName}</td>
                     <td class="p-6 text-xs text-slate-500 font-bold uppercase">${a.role}</td>
@@ -637,20 +714,15 @@
                     <td class="p-6 text-xs text-slate-500">${grantDateDisplay}</td>
                     <td class="p-6 text-xs text-slate-500">${expiryDisplay}</td>
                     <td class="p-6 text-center">
-                        <span class="px-2 py-1 rounded-full text-[9px] font-black uppercase ${statusClass}">
-                            ${sl}
-                        </span>
+                        <span class="px-2 py-1 rounded-full text-[9px] font-black uppercase ${statusClass}">${sl}</span>
                     </td>
                     <td class="p-6 text-right">
                         ${sl === 'Active'
                             ? `<button onclick="confirmAction('revoke', ${assignments.indexOf(a)})"
-                                   class="text-rose-600 text-[10px] font-black uppercase hover:underline">
-                               Revoke
-                           </button>`
+                                   class="text-rose-600 text-[10px] font-black uppercase hover:underline">Revoke</button>`
                             : '—'}
                     </td>
-                </tr>`;
-                    logTable.insertAdjacentHTML('beforeend', row);
+                </tr>`);
                 }
             });
         }
@@ -659,26 +731,19 @@
             const appS = (document.getElementById('appSearch')?.value || "").toLowerCase().trim();
             const appGrid = document.getElementById('appGrid');
             appGrid.innerHTML = "";
-            apps
-                .filter(a => !a.deleted)
-                .forEach(a => {
-                    if (!appS || String(a.name || "").toLowerCase().includes(appS)) {
-                        const host = (a.link || "").replace(/^(?:https?:\/\/)?(?:www\.)?/i, "").split('/')[0];
-                        const logoSrc = host
-                            ? `https://logo.clearbit.com/${host}`
-                            : `https://ui-avatars.com/api/?name=${encodeURIComponent(a.name || '')}`;
-                        const fallback = `https://ui-avatars.com/api/?name=${encodeURIComponent(a.name || '')}`;
-                        const card = `<div onclick="showAppDetail('${a.id}')"
-                                   class="bg-slate-900 border border-slate-800 p-6 rounded-3xl text-center cursor-pointer hover:border-blue-500 transition-all">
-                        <img src="${logoSrc}"
-                             onerror="this.src='${fallback}'"
-                             class="w-12 h-12 mx-auto mb-4 object-contain rounded-lg">
+            apps.filter(a => !a.deleted).forEach(a => {
+                if (!appS || String(a.name || "").toLowerCase().includes(appS)) {
+                    const host = (a.link || "").replace(/^(?:https?:\/\/)?(?:www\.)?/i, "").split('/')[0];
+                    const logoSrc = host ? `https://logo.clearbit.com/${host}` : `https://ui-avatars.com/api/?name=${encodeURIComponent(a.name || '')}`;
+                    const fallback = `https://ui-avatars.com/api/?name=${encodeURIComponent(a.name || '')}`;
+                    appGrid.insertAdjacentHTML('beforeend', `<div onclick="showAppDetail('${a.id}')"
+                               class="bg-slate-900 border border-slate-800 p-6 rounded-3xl text-center cursor-pointer hover:border-blue-500 transition-all">
+                        <img src="${logoSrc}" onerror="this.src='${fallback}'" class="w-12 h-12 mx-auto mb-4 object-contain rounded-lg">
                         <h4 class="font-black text-sm text-white">${a.name}</h4>
                         <span class="text-[8px] text-slate-500 uppercase mt-2 block">View Details</span>
-                    </div>`;
-                        appGrid.insertAdjacentHTML('beforeend', card);
-                    }
-                });
+                    </div>`);
+                }
+            });
         }
 
         function renderExpiredTable(expItemsRaw) {
@@ -702,12 +767,11 @@
             const logBody = document.getElementById('systemLogTableBody');
             logBody.innerHTML = "";
             systemLogs.slice().reverse().forEach(log => {
-                const row = `<tr>
+                logBody.insertAdjacentHTML('beforeend', `<tr>
                 <td class="p-6 text-xs text-slate-400 w-1/4">${new Date(log.ts).toLocaleString()}</td>
                 <td class="p-6 text-xs font-bold uppercase w-1/4">${log.event}</td>
                 <td class="p-6 text-slate-300">${log.detail}</td>
-            </tr>`;
-                logBody.insertAdjacentHTML('beforeend', row);
+            </tr>`);
             });
         }
 
@@ -716,24 +780,21 @@
             authList.innerHTML = authorizers.map(name =>
                 `<div class="bg-slate-700 p-3 rounded-lg flex justify-between items-center">
                 <span class="text-white font-bold">${name}</span>
-                <button onclick="deleteAuthorizer('${name}')"
-                        class="text-rose-500 hover:text-rose-400">✖</button>
+                <button onclick="deleteAuthorizer('${name}')" class="text-rose-500 hover:text-rose-400">✖</button>
             </div>`
             ).join('');
         }
 
-        // DETAIL VIEWS
+        // ─── DETAIL VIEWS ──────────────────────────────────────────────────────────
+
         function showUserDetail(userId) {
             const user = users.find(u => u.id == userId);
             if (!user) return;
             const userAssignments = assignments.filter(a => a.userId == userId).slice().reverse();
-            let detailHtml = `
+            document.getElementById('view-user-detail').innerHTML = `
             <div class="flex justify-between items-center mb-6">
                 <h2 class="text-4xl font-black uppercase text-white tracking-tighter">${user.name}</h2>
-                <button onclick="switchTab('users')"
-                        class="bg-slate-700 p-4 rounded-xl font-black text-white text-xs uppercase">
-                    ← Back to Users
-                </button>
+                <button onclick="switchTab('users')" class="bg-slate-700 p-4 rounded-xl font-black text-white text-xs uppercase">← Back to Users</button>
             </div>
             <div class="bg-slate-900 border border-slate-800 rounded-3xl p-8 mb-6 grid grid-cols-4 gap-4">
                 <div><span class="text-xs font-bold text-slate-500">EMP ID</span><p class="font-bold text-white">${user.empID}</p></div>
@@ -746,46 +807,29 @@
                 <table class="w-full text-left">
                     <thead class="bg-slate-800 text-[10px] uppercase font-black text-slate-400">
                         <tr>
-                            <th class="p-6">Resource</th>
-                            <th class="p-6">Role</th>
-                            <th class="p-6">Authorized By</th>
-                            <th class="p-6">Date</th>
-                            <th class="p-6">Expiry</th>
-                            <th class="p-6 text-center">Status</th>
+                            <th class="p-6">Resource</th><th class="p-6">Role</th>
+                            <th class="p-6">Authorized By</th><th class="p-6">Date</th>
+                            <th class="p-6">Expiry</th><th class="p-6 text-center">Status</th>
                         </tr>
                     </thead>
                     <tbody>${userAssignments.map(a => {
-                const isExpired = a.status === 'Active' && a.expiry !== 'No Expiration' && new Date() > new Date(a.expiry);
-                const sl = isExpired ? 'Expired' : a.status;
-                const statusClass =
-                    sl === 'Active' ? 'bg-emerald-900/30 text-emerald-400'
-                        : (sl === 'Expired' ? 'bg-rose-900/30 text-rose-400'
-                            : 'bg-slate-700 text-slate-400');
-                return `<tr>
+                        const isExpired = a.status === 'Active' && a.expiry !== 'No Expiration' && new Date() > new Date(a.expiry);
+                        const sl = isExpired ? 'Expired' : a.status;
+                        const sc = sl === 'Active' ? 'bg-emerald-900/30 text-emerald-400' : (sl === 'Expired' ? 'bg-rose-900/30 text-rose-400' : 'bg-slate-700 text-slate-400');
+                        return `<tr>
                             <td class="p-6 text-blue-400 font-bold">${a.appName}</td>
                             <td class="p-6 text-slate-300">${a.role}</td>
                             <td class="p-6 text-slate-400">${a.authorizedBy}</td>
                             <td class="p-6 text-slate-500">${new Date(a.date).toLocaleDateString()}</td>
-                            <td class="p-6 text-slate-500">${a.expiry === 'No Expiration'
-                        ? 'Never'
-                        : new Date(a.expiry).toLocaleDateString()}</td>
-                            <td class="p-6 text-center">
-                                <span class="px-2 py-1 rounded-full text-[9px] font-black uppercase ${statusClass}">
-                                    ${sl}
-                                </span>
-                            </td>
+                            <td class="p-6 text-slate-500">${a.expiry === 'No Expiration' ? 'Never' : new Date(a.expiry).toLocaleDateString()}</td>
+                            <td class="p-6 text-center"><span class="px-2 py-1 rounded-full text-[9px] font-black uppercase ${sc}">${sl}</span></td>
                         </tr>`;
-            }).join('')}</tbody>
+                    }).join('')}</tbody>
                 </table>
             </div>
             <div class="mt-6 text-right">
-                <button onclick="confirmAction('deleteUser', '${user.id}')"
-                        class="bg-rose-800 text-white p-4 rounded-xl font-black text-xs uppercase">
-                    Delete User
-                </button>
-            </div>
-        `;
-            document.getElementById('view-user-detail').innerHTML = detailHtml;
+                <button onclick="confirmAction('deleteUser', '${user.id}')" class="bg-rose-800 text-white p-4 rounded-xl font-black text-xs uppercase">Delete User</button>
+            </div>`;
             switchTab('user-detail');
         }
 
@@ -793,60 +837,38 @@
             const app = apps.find(a => a.id == appId);
             if (!app) return;
             const appAssignments = assignments.filter(a => a.appName == app.name).slice().reverse();
-            let detailHtml = `
+            document.getElementById('view-app-detail').innerHTML = `
             <div class="flex justify-between items-center mb-6">
                 <h2 class="text-4xl font-black uppercase text-white tracking-tighter">${app.name}</h2>
-                <button onclick="switchTab('apps')"
-                        class="bg-slate-700 p-4 rounded-xl font-black text-white text-xs uppercase">
-                    ← Back to Apps
-                </button>
+                <button onclick="switchTab('apps')" class="bg-slate-700 p-4 rounded-xl font-black text-white text-xs uppercase">← Back to Apps</button>
             </div>
             <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden">
                 <table class="w-full text-left">
                     <thead class="bg-slate-800 text-[10px] uppercase font-black text-slate-400">
-                        <tr>
-                            <th class="p-6">User</th>
-                            <th class="p-6">Role</th>
-                            <th class="p-6">Date</th>
-                            <th class="p-6 text-center">Status</th>
-                        </tr>
+                        <tr><th class="p-6">User</th><th class="p-6">Role</th><th class="p-6">Date</th><th class="p-6 text-center">Status</th></tr>
                     </thead>
                     <tbody>${appAssignments.map(a => {
-                const isExpired = a.status === 'Active' && a.expiry !== 'No Expiration' && new Date() > new Date(a.expiry);
-                const sl = isExpired ? 'Expired' : a.status;
-                const statusClass =
-                    sl === 'Active' ? 'bg-emerald-900/30 text-emerald-400'
-                        : (sl === 'Expired' ? 'bg-rose-900/30 text-rose-400'
-                            : 'bg-slate-700 text-slate-400');
-                return `<tr>
+                        const isExpired = a.status === 'Active' && a.expiry !== 'No Expiration' && new Date() > new Date(a.expiry);
+                        const sl = isExpired ? 'Expired' : a.status;
+                        const sc = sl === 'Active' ? 'bg-emerald-900/30 text-emerald-400' : (sl === 'Expired' ? 'bg-rose-900/30 text-rose-400' : 'bg-slate-700 text-slate-400');
+                        return `<tr>
                             <td class="p-6 font-bold text-white">${a.userName}</td>
                             <td class="p-6 text-slate-300">${a.role}</td>
                             <td class="p-6 text-slate-500">${new Date(a.date).toLocaleDateString()}</td>
-                            <td class="p-6 text-center">
-                                <span class="px-2 py-1 rounded-full text-[9px] font-black uppercase ${statusClass}">
-                                    ${sl}
-                                </span>
-                            </td>
+                            <td class="p-6 text-center"><span class="px-2 py-1 rounded-full text-[9px] font-black uppercase ${sc}">${sl}</span></td>
                         </tr>`;
-            }).join('')}</tbody>
+                    }).join('')}</tbody>
                 </table>
             </div>
             <div class="mt-6 text-right flex justify-end gap-4">
-                <button onclick="launchApp('${app.link}')"
-                        class="bg-blue-600 text-white p-4 rounded-xl font-black text-xs uppercase">
-                    Launch App
-                </button>
-                <button onclick="confirmAction('deleteApp', '${app.id}')"
-                        class="bg-rose-800 text-white p-4 rounded-xl font-black text-xs uppercase">
-                    Delete App
-                </button>
-            </div>
-        `;
-            document.getElementById('view-app-detail').innerHTML = detailHtml;
+                <button onclick="launchApp('${app.link}')" class="bg-blue-600 text-white p-4 rounded-xl font-black text-xs uppercase">Launch App</button>
+                <button onclick="confirmAction('deleteApp', '${app.id}')" class="bg-rose-800 text-white p-4 rounded-xl font-black text-xs uppercase">Delete App</button>
+            </div>`;
             switchTab('app-detail');
         }
 
-        // CRUD & ACTIONS
+        // ─── CRUD & ACTIONS ────────────────────────────────────────────────────────
+
         function quickGrant() {
             const userId = document.getElementById('form-user').value;
             const appName = document.getElementById('form-app').value;
@@ -864,10 +886,7 @@
             }
 
             assignments.push({
-                id: Date.now(),
-                userId,
-                userName: user.name,
-                appName,
+                id: Date.now(), userId, userName: user.name, appName,
                 role: document.getElementById('form-role').value,
                 authorizedBy: document.getElementById('form-auth').value,
                 status: 'Active',
@@ -889,26 +908,21 @@
                     email: document.getElementById('m-email').value,
                 };
                 if (!data.name) return alert('User name is required.');
-
-                if (editingId) { // Editing existing user
+                if (editingId) {
                     const index = users.findIndex(x => x.id == editingId);
                     if (index > -1) {
                         const oldName = users[index].name;
                         users[index] = { ...users[index], ...data };
-                        // Update assignments with new name
                         if (oldName !== data.name) {
-                            assignments.forEach(a => {
-                                if (a.userId == editingId) a.userName = data.name;
-                            });
+                            assignments.forEach(a => { if (a.userId == editingId) a.userName = data.name; });
                         }
                         logSystemEvent('User Edit', `User ${data.name} (ID: ${data.empID}) was updated.`);
                     }
-                } else { // Adding new user
-                    const newUser = { id: Date.now(), deleted: false, ...data };
-                    users.push(newUser);
+                } else {
+                    users.push({ id: Date.now(), deleted: false, ...data });
                     logSystemEvent('User Added', `New user ${data.name} (ID: ${data.empID}) was created.`);
                 }
-            } else { // Adding App (no edit flow for apps)
+            } else {
                 const data = {
                     name: document.getElementById('m-appname').value,
                     link: document.getElementById('m-link').value
@@ -923,18 +937,18 @@
 
         function revoke(assignmentIndex, authorizer) {
             if (assignments[assignmentIndex]) {
-                const assignment = assignments[assignmentIndex];
-                assignment.status = 'Revoked';
-                logSystemEvent('Access Revoked', `Access to ${assignment.appName} for ${assignment.userName} revoked by ${authorizer}.`);
+                const a = assignments[assignmentIndex];
+                a.status = 'Revoked';
+                logSystemEvent('Access Revoked', `Access to ${a.appName} for ${a.userName} revoked by ${authorizer}.`);
                 saveAndRender();
             }
         }
 
         function quickRenew(assignmentIndex, authorizer) {
             if (assignments[assignmentIndex]) {
-                const assignment = assignments[assignmentIndex];
-                assignment.expiry = 'No Expiration';
-                logSystemEvent('Access Renewed', `Access for ${assignment.userName} to ${assignment.appName} renewed by ${authorizer}.`);
+                const a = assignments[assignmentIndex];
+                a.expiry = 'No Expiration';
+                logSystemEvent('Access Renewed', `Access for ${a.userName} to ${a.appName} renewed by ${authorizer}.`);
                 saveAndRender();
             }
         }
@@ -943,21 +957,16 @@
             const userIndex = users.findIndex(u => u.id == userId);
             if (userIndex > -1) {
                 const user = users[userIndex];
-
                 if (isAdmin()) {
-                    // HARD DELETE
                     logSystemEvent('User Deleted', `User ${user.name} (ID: ${user.empID}) hard-deleted by ${authorizer}.`);
                     users.splice(userIndex, 1);
                     assignments = assignments.filter(a => a.userId != userId);
-                } else if (isManager()) {
-                    // SOFT DELETE
+                } else {
                     if (!user.deleted) {
                         user.deleted = true;
                         logSystemEvent('User Soft-Deleted', `User ${user.name} (ID: ${user.empID}) soft-deleted by ${authorizer}.`);
                     }
-                    // Keep assignments for history
                 }
-
                 saveAndRender();
                 switchTab('users');
             }
@@ -967,21 +976,16 @@
             const appIndex = apps.findIndex(a => a.id == appId);
             if (appIndex > -1) {
                 const app = apps[appIndex];
-
                 if (isAdmin()) {
-                    // HARD DELETE
                     logSystemEvent('App Deleted', `Application ${app.name} hard-deleted by ${authorizer}.`);
                     apps.splice(appIndex, 1);
                     assignments = assignments.filter(a => a.appName != app.name);
-                } else if (isManager()) {
-                    // SOFT DELETE
+                } else {
                     if (!app.deleted) {
                         app.deleted = true;
                         logSystemEvent('App Soft-Deleted', `Application ${app.name} soft-deleted by ${authorizer}.`);
                     }
-                    // Keep assignments
                 }
-
                 saveAndRender();
                 switchTab('apps');
             }
@@ -993,7 +997,8 @@
             location.reload();
         }
 
-        // MODALS & CONFIRMATIONS
+        // ─── MODALS ────────────────────────────────────────────────────────────────
+
         function openModal(type) {
             editingId = null;
             const isUser = type === 'user';
@@ -1032,70 +1037,39 @@
 
         function confirmAction(action, data) {
             const modal = document.getElementById('confirmModal');
-            const title = document.getElementById('confirmTitle');
-            const msg = document.getElementById('confirmMsg');
-            const confirmBtn = document.getElementById('confirmBtn');
-
             const authDropdown = document.getElementById('authSelector');
             authDropdown.innerHTML = authorizers.map(a => `<option value="${a}">${a}</option>`).join('');
 
             let actionText = '';
             switch (action) {
-                case 'revoke':
-                    actionText = 'revoke access';
-                    break;
-                case 'renew':
-                    actionText = 'renew this access';
-                    break;
-                case 'deleteUser':
-                    actionText = isAdmin()
-                        ? 'permanently delete this user and all their access'
-                        : 'soft-delete this user (hide from lists)';
-                    break;
-                case 'deleteApp':
-                    actionText = isAdmin()
-                        ? 'permanently delete this app and all associated access'
-                        : 'soft-delete this app (hide from lists)';
-                    break;
-                case 'hardReset':
-                    actionText = 'PERMANENTLY WIPE ALL DATA';
-                    break;
+                case 'revoke': actionText = 'revoke access'; break;
+                case 'renew': actionText = 'renew this access'; break;
+                case 'deleteUser': actionText = isAdmin() ? 'permanently delete this user and all their access' : 'soft-delete this user (hide from lists)'; break;
+                case 'deleteApp': actionText = isAdmin() ? 'permanently delete this app and all associated access' : 'soft-delete this app (hide from lists)'; break;
+                case 'hardReset': actionText = 'PERMANENTLY WIPE ALL DATA'; break;
             }
-            title.innerText = `Confirm ${action}`;
-            msg.innerText = `Are you sure you want to ${actionText}? This action will be logged.`;
+            document.getElementById('confirmTitle').innerText = `Confirm ${action}`;
+            document.getElementById('confirmMsg').innerText = `Are you sure you want to ${actionText}? This action will be logged.`;
             modal.classList.remove('hidden');
 
-            confirmBtn.onclick = () => {
+            document.getElementById('confirmBtn').onclick = () => {
                 const authorizer = authDropdown.value;
                 if (!authorizer) return alert('Please select an authorizer.');
-
                 closeAllModals();
-
                 switch (action) {
-                    case 'revoke':
-                        revoke(data, authorizer);
-                        break;
-                    case 'renew':
-                        quickRenew(data, authorizer);
-                        break;
-                    case 'deleteUser':
-                        deleteUser(data, authorizer);
-                        break;
-                    case 'deleteApp':
-                        deleteApp(data, authorizer);
-                        break;
+                    case 'revoke': revoke(data, authorizer); break;
+                    case 'renew': quickRenew(data, authorizer); break;
+                    case 'deleteUser': deleteUser(data, authorizer); break;
+                    case 'deleteApp': deleteApp(data, authorizer); break;
                     case 'hardReset':
-                        if (!isAdmin()) {
-                            alert('Only Admin users can perform a hard reset.');
-                            return;
-                        }
-                        hardResetApp(authorizer);
-                        break;
+                        if (!isAdmin()) { alert('Only Admin users can perform a hard reset.'); return; }
+                        hardResetApp(authorizer); break;
                 }
             };
         }
 
-        // SETTINGS & DATA MGMT
+        // ─── SETTINGS & DATA MGMT ─────────────────────────────────────────────────
+
         function addAuthorizer() {
             const newName = document.getElementById('newAuthName').value.trim();
             if (newName && !authorizers.includes(newName)) {
@@ -1131,31 +1105,24 @@
         function restoreData(file) {
             if (!file) return;
             if (!confirm("Are you sure you want to restore from this backup? This will overwrite all current data.")) return;
-
             const reader = new FileReader();
             reader.onload = (e) => {
                 try {
                     const data = JSON.parse(e.target.result);
                     if (data.users && data.apps && data.assignments && data.systemLogs && data.authorizers) {
-                        users = data.users;
-                        apps = data.apps;
-                        assignments = data.assignments;
-                        systemLogs = data.systemLogs;
-                        authorizers = data.authorizers;
+                        users = data.users; apps = data.apps; assignments = data.assignments;
+                        systemLogs = data.systemLogs; authorizers = data.authorizers;
                         logSystemEvent('Restore', 'System restored from backup file.');
                         saveAndRender();
                         alert("Restore successful!");
-                    } else {
-                        alert("Invalid backup file format.");
-                    }
-                } catch (error) {
-                    alert("Error reading backup file. It may be corrupted.");
-                }
+                    } else { alert("Invalid backup file format."); }
+                } catch { alert("Error reading backup file. It may be corrupted."); }
             };
             reader.readAsText(file);
         }
 
-        // HELPERS
+        // ─── HELPERS ──────────────────────────────────────────────────────────────
+
         function saveAndRender() {
             localStorage.setItem('ap_users', JSON.stringify(users));
             localStorage.setItem('ap_apps', JSON.stringify(apps));
@@ -1172,15 +1139,11 @@
 
         function updateFormOptions() {
             const userId = document.getElementById('form-user').value;
-            const activeAppNames = assignments
-                .filter(a => a.userId == userId && a.status === 'Active')
-                .map(a => a.appName);
+            const activeAppNames = assignments.filter(a => a.userId == userId && a.status === 'Active').map(a => a.appName);
             document.getElementById('form-app').innerHTML =
                 '<option disabled selected value="">Choose App</option>' +
-                apps
-                    .filter(ap => !ap.deleted && !activeAppNames.includes(ap.name))
-                    .map(ap => `<option value="${ap.name}">${ap.name}</option>`)
-                    .join('');
+                apps.filter(ap => !ap.deleted && !activeAppNames.includes(ap.name))
+                    .map(ap => `<option value="${ap.name}">${ap.name}</option>`).join('');
         }
 
         function autoSelectDept() {
@@ -1202,7 +1165,6 @@
                 const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
                 const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1 });
                 const h = rows[0].map(i => String(i).toLowerCase().trim());
-
                 if (type === 'user') {
                     const nI = h.findIndex(x => x.includes('name') || x.includes('full'));
                     const idI = h.findIndex(x => x.includes('id') || x.includes('emp'));
@@ -1210,27 +1172,14 @@
                     const eI = h.findIndex(x => x.includes('mail'));
                     const mI = h.findIndex(x => x.includes('manager'));
                     rows.slice(1).forEach(r => {
-                        if (r[nI]) users.push({
-                            id: Date.now() + Math.random(),
-                            deleted: false,
-                            empID: r[idI] || '—',
-                            name: r[nI],
-                            dept: r[dI] || '—',
-                            manager: r[mI] || '—',
-                            email: r[eI] || '—'
-                        });
+                        if (r[nI]) users.push({ id: Date.now() + Math.random(), deleted: false, empID: r[idI] || '—', name: r[nI], dept: r[dI] || '—', manager: r[mI] || '—', email: r[eI] || '—' });
                     });
                     logSystemEvent('Import', `${rows.length - 1} users imported from file.`);
-                } else { // 'app'
+                } else {
                     const nI = h.findIndex(x => x.includes('name') || x.includes('app'));
                     const lI = h.findIndex(x => x.includes('link') || x.includes('url'));
                     rows.slice(1).forEach(r => {
-                        if (r[nI]) apps.push({
-                            id: Date.now() + Math.random(),
-                            deleted: false,
-                            name: r[nI],
-                            link: r[lI] || ''
-                        });
+                        if (r[nI]) apps.push({ id: Date.now() + Math.random(), deleted: false, name: r[nI], link: r[lI] || '' });
                     });
                     logSystemEvent('Import', `${rows.length - 1} apps imported from file.`);
                 }
@@ -1241,45 +1190,49 @@
         }
 
         function exportLogsCSV() {
-            let csvContent = "Employee,Resource,Role,Authorized By,Grant Date,Expiry,Status\n";
+            let csv = "Employee,Resource,Role,Authorized By,Grant Date,Expiry,Status\n";
             assignments.forEach(a => {
                 const isExpired = a.status === 'Active' && a.expiry !== 'No Expiration' && new Date() > new Date(a.expiry);
                 const status = isExpired ? 'Expired' : a.status;
-                const row = [a.userName, a.appName, a.role, a.authorizedBy, a.date, a.expiry, status]
-                    .map(field => `"${String(field).replace(/"/g, '""')}"`).join(',');
-                csvContent += row + "\n";
+                csv += [a.userName, a.appName, a.role, a.authorizedBy, a.date, a.expiry, status]
+                    .map(f => `"${String(f).replace(/"/g, '""')}"`).join(',') + "\n";
             });
-            downloadCSV(csvContent, 'Access_Log');
+            downloadCSV(csv, 'Access_Log');
         }
 
         function exportSystemLogsCSV() {
-            let csvContent = "Timestamp,Event,Details\n";
+            let csv = "Timestamp,Event,Details\n";
             systemLogs.forEach(log => {
-                const row = [log.ts, log.event, log.detail]
-                    .map(field => `"${String(field).replace(/"/g, '""')}"`).join(',');
-                csvContent += row + "\n";
+                csv += [log.ts, log.event, log.detail]
+                    .map(f => `"${String(f).replace(/"/g, '""')}"`).join(',') + "\n";
             });
-            downloadCSV(csvContent, 'System_Log');
+            downloadCSV(csv, 'System_Log');
         }
 
         function downloadCSV(csvContent, baseName) {
             const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
-            a.setAttribute("href", url);
-            a.setAttribute("download", `${baseName}_${new Date().toISOString().split('T')[0]}.csv`);
+            a.href = url;
+            a.download = `${baseName}_${new Date().toISOString().split('T')[0]}.csv`;
             a.style.display = 'none';
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
         }
 
-        // INITIAL LOAD
+        // ─── INITIAL LOAD ─────────────────────────────────────────────────────────
         applyTheme();
         updateIdentityIndicators();
-        // For now, always show login; you can auto-resume sessions here if you want.
+
+        // Auto-resume session if already logged in (e.g. page refresh)
+        if (currentUserEmail && currentUserType) {
+            document.getElementById('loginScreen').classList.add('hidden');
+            document.getElementById('mainContent').classList.remove('hidden');
+            applyRoleUI();
+            renderData();
+        }
     </script>
 
 </body>
-
 </html>
